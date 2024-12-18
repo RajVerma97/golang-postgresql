@@ -12,15 +12,16 @@ import (
 )
 
 type Movie struct {
-	ID          string    `json:"id"`
+	ID          int       `json:"id"`
 	Title       string    `json:"title"`
 	Description string    `json:"description"`
-	ReleaseYear int16     `json:"release_year"`
+	ReleaseYear int       `json:"release_year"`
 	Poster      string    `json:"poster"`
-	Director    *Director `json:"director"`
+	Director    *Director `json:"director,omitempty"`
 }
 
 type Director struct {
+	ID        int    `json:"id,omitempty"`
 	FirstName string `json:"first_name"`
 	LastName  string `json:"last_name"`
 }
@@ -40,14 +41,90 @@ func connectToDB() {
 	if err != nil {
 		log.Fatal("Could not connect to the database: ", err)
 	}
+	log.Println("Successfully connected to database")
+}
+
+func createMovie(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	var movie Movie
+	err := json.NewDecoder(r.Body).Decode(&movie)
+	if err != nil {
+		log.Printf("Decode error: %v", err)
+		http.Error(w, "Invalid input", http.StatusBadRequest)
+		return
+	}
+
+	// Check if the director exists, if not, insert the director
+	var directorID int
+	err = db.QueryRow(`
+        SELECT id FROM directors WHERE first_name = $1 AND last_name = $2
+    `, movie.Director.FirstName, movie.Director.LastName).Scan(&directorID)
+
+	// If the director doesn't exist, insert the director and get the ID
+	if err != nil {
+		if err == sql.ErrNoRows {
+			err = db.QueryRow(`
+                INSERT INTO directors (first_name, last_name)
+                VALUES ($1, $2)
+                RETURNING id
+            `, movie.Director.FirstName, movie.Director.LastName).Scan(&directorID)
+			if err != nil {
+				log.Printf("Insert director error: %v", err)
+				http.Error(w, "Failed to insert director", http.StatusInternalServerError)
+				return
+			}
+		} else {
+			log.Printf("Query error: %v", err)
+			http.Error(w, "Failed to check director", http.StatusInternalServerError)
+			return
+		}
+	}
+
+	// Now insert the movie with the valid director_id
+	query := `
+        INSERT INTO movies (title, description, release_year, poster, director_id)
+        VALUES ($1, $2, $3, $4, $5)
+        RETURNING id
+    `
+
+	var movieID int
+	err = db.QueryRow(query, movie.Title, movie.Description, movie.ReleaseYear, movie.Poster, directorID).Scan(&movieID)
+	if err != nil {
+		log.Printf("Insert error: %v", err)
+		http.Error(w, "Failed to create movie", http.StatusInternalServerError)
+		return
+	}
+
+	movie.ID = movieID
+	movie.Director.ID = directorID // Ensure the director ID is included in the response
+
+	// Respond with the created movie
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(movie)
 }
 
 // Get all movies
 func getMovies(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
-	rows, err := db.Query("SELECT id, title, description, release_year, poster, director_first_name, director_last_name FROM movies")
+	query := `
+		SELECT 
+			m.id, 
+			m.title, 
+			m.description, 
+			m.release_year, 
+			m.poster, 
+			d.id as director_id,
+			d.first_name, 
+			d.last_name 
+		FROM movies m
+		LEFT JOIN directors d ON m.director_id = d.id
+	`
+
+	rows, err := db.Query(query)
 	if err != nil {
+		log.Printf("Query error: %v", err)
 		http.Error(w, "Unable to fetch movies", http.StatusInternalServerError)
 		return
 	}
@@ -56,13 +133,36 @@ func getMovies(w http.ResponseWriter, r *http.Request) {
 	var movies []Movie
 	for rows.Next() {
 		var movie Movie
-		var directorFirstName, directorLastName string
-		if err := rows.Scan(&movie.ID, &movie.Title, &movie.Description, &movie.ReleaseYear, &movie.Poster, &directorFirstName, &directorLastName); err != nil {
+		var director Director
+		var directorID sql.NullInt64
+
+		if err := rows.Scan(
+			&movie.ID,
+			&movie.Title,
+			&movie.Description,
+			&movie.ReleaseYear,
+			&movie.Poster,
+			&directorID,
+			&director.FirstName,
+			&director.LastName,
+		); err != nil {
+			log.Printf("Scan error: %v", err)
 			http.Error(w, "Error scanning movie", http.StatusInternalServerError)
 			return
 		}
-		movie.Director = &Director{FirstName: directorFirstName, LastName: directorLastName}
+
+		if directorID.Valid {
+			director.ID = int(directorID.Int64)
+			movie.Director = &director
+		}
+
 		movies = append(movies, movie)
+	}
+
+	if err = rows.Err(); err != nil {
+		log.Printf("Rows error: %v", err)
+		http.Error(w, "Error processing movies", http.StatusInternalServerError)
+		return
 	}
 
 	json.NewEncoder(w).Encode(movies)
@@ -70,80 +170,153 @@ func getMovies(w http.ResponseWriter, r *http.Request) {
 
 func getMovie(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
+
+	// Get the movie ID from the URL
 	params := mux.Vars(r)
+	movieID := params["id"]
 
-	row := db.QueryRow("SELECT id, title, description, release_year, poster, director_first_name, director_last_name FROM movies WHERE id=$1", params["id"])
+	// Query to fetch movie by ID
+	query := `
+        SELECT 
+            m.id, 
+            m.title, 
+            m.description, 
+            m.release_year, 
+            m.poster, 
+            d.id as director_id,
+            d.first_name, 
+            d.last_name 
+        FROM movies m
+        LEFT JOIN directors d ON m.director_id = d.id
+        WHERE m.id = $1
+    `
 
+	// Execute the query
+	row := db.QueryRow(query, movieID)
+
+	// Create variables to store the movie data
 	var movie Movie
-	var directorFirstName, directorLastName string
-	if err := row.Scan(&movie.ID, &movie.Title, &movie.Description, &movie.ReleaseYear, &movie.Poster, &directorFirstName, &directorLastName); err != nil {
-		http.Error(w, "Movie not found", http.StatusNotFound)
-		return
-	}
-	movie.Director = &Director{FirstName: directorFirstName, LastName: directorLastName}
-	json.NewEncoder(w).Encode(movie)
-}
+	var director Director
+	var directorID sql.NullInt64
 
-// Create a new movie
-func createMovie(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	var movie Movie
+	// Scan the result into variables
+	err := row.Scan(
+		&movie.ID,
+		&movie.Title,
+		&movie.Description,
+		&movie.ReleaseYear,
+		&movie.Poster,
+		&directorID,
+		&director.FirstName,
+		&director.LastName,
+	)
 
-	if err := json.NewDecoder(r.Body).Decode(&movie); err != nil {
-		http.Error(w, "Invalid input", http.StatusBadRequest)
-		return
-	}
-
-	// Insert into the database
-	var id string
-	err := db.QueryRow(
-		"INSERT INTO movies (title, description, release_year, poster, director_first_name, director_last_name) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
-		movie.Title, movie.Description, movie.ReleaseYear, movie.Poster, movie.Director.FirstName, movie.Director.LastName).Scan(&id)
 	if err != nil {
-		http.Error(w, "Failed to create movie", http.StatusInternalServerError)
+		if err == sql.ErrNoRows {
+			http.Error(w, "Movie not found", http.StatusNotFound)
+		} else {
+			log.Printf("Query error: %v", err)
+			http.Error(w, "Error fetching movie", http.StatusInternalServerError)
+		}
 		return
 	}
-	movie.ID = id
 
+	// If a director is found, set the director details
+	if directorID.Valid {
+		director.ID = int(directorID.Int64)
+		movie.Director = &director
+	}
+
+	// Respond with the movie details
 	json.NewEncoder(w).Encode(movie)
 }
 
-// Delete a movie
 func deleteMovie(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	params := mux.Vars(r)
 
-	_, err := db.Exec("DELETE FROM movies WHERE id=$1", params["id"])
+	// Get movie ID from URL params
+	params := mux.Vars(r)
+	movieId := params["id"]
+
+	// Execute the delete query
+	query := `DELETE FROM movies WHERE id = $1`
+
+	// Delete the movie by ID
+	_, err := db.Exec(query, movieId)
 	if err != nil {
+		log.Printf("Error deleting movie: %v", err)
 		http.Error(w, "Failed to delete movie", http.StatusInternalServerError)
 		return
 	}
 
-	json.NewEncoder(w).Encode(map[string]string{"message": "Movie deleted"})
+	// Respond with a success message
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{
+		"message": fmt.Sprintf("Movie with ID %s successfully deleted", movieId),
+	})
 }
-
-// Update a movie
 func updateMovie(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	params := mux.Vars(r)
-	var movie Movie
 
-	if err := json.NewDecoder(r.Body).Decode(&movie); err != nil {
+	// Get movie ID from URL params
+	params := mux.Vars(r)
+	movieId := params["id"]
+
+	// Decode the request body to get the updated movie details
+	var movie Movie
+	err := json.NewDecoder(r.Body).Decode(&movie)
+	if err != nil {
+		log.Printf("Decode error: %v", err)
 		http.Error(w, "Invalid input", http.StatusBadRequest)
 		return
 	}
 
-	// Update the movie in the database
-	_, err := db.Exec(
-		"UPDATE movies SET title=$1, description=$2, release_year=$3, poster=$4, director_first_name=$5, director_last_name=$6 WHERE id=$7",
-		movie.Title, movie.Description, movie.ReleaseYear, movie.Poster, movie.Director.FirstName, movie.Director.LastName, params["id"])
+	// Check if the director exists, if not, insert the director
+	var directorID int
+	err = db.QueryRow(`
+        SELECT id FROM directors WHERE first_name = $1 AND last_name = $2
+    `, movie.Director.FirstName, movie.Director.LastName).Scan(&directorID)
+
+	// If the director doesn't exist, insert the director and get the ID
 	if err != nil {
+		if err == sql.ErrNoRows {
+			err = db.QueryRow(`
+                INSERT INTO directors (first_name, last_name)
+                VALUES ($1, $2)
+                RETURNING id
+            `, movie.Director.FirstName, movie.Director.LastName).Scan(&directorID)
+			if err != nil {
+				log.Printf("Insert director error: %v", err)
+				http.Error(w, "Failed to insert director", http.StatusInternalServerError)
+				return
+			}
+		} else {
+			log.Printf("Query error: %v", err)
+			http.Error(w, "Failed to check director", http.StatusInternalServerError)
+			return
+		}
+	}
+
+	// Now update the movie with the new details and valid director_id
+	query := `
+        UPDATE movies
+        SET title = $1, description = $2, release_year = $3, poster = $4, director_id = $5
+        WHERE id = $6
+    `
+
+	// Execute the update query
+	_, err = db.Exec(query, movie.Title, movie.Description, movie.ReleaseYear, movie.Poster, directorID, movieId)
+	if err != nil {
+		log.Printf("Update error: %v", err)
 		http.Error(w, "Failed to update movie", http.StatusInternalServerError)
 		return
 	}
 
-	movie.ID = params["id"]
-	json.NewEncoder(w).Encode(movie)
+	// Respond with a success message
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{
+		"message": fmt.Sprintf("Movie with ID %s successfully updated", movieId),
+	})
 }
 
 func main() {
@@ -152,12 +325,11 @@ func main() {
 
 	r := mux.NewRouter()
 	r.HandleFunc("/movies", getMovies).Methods("GET")
-	r.HandleFunc("/movies/{id}", getMovie).Methods("GET")
 	r.HandleFunc("/movies", createMovie).Methods("POST")
-	r.HandleFunc("/movies/{id}", updateMovie).Methods("PUT")
+	r.HandleFunc("/movies/{id}", getMovie).Methods("GET")
 	r.HandleFunc("/movies/{id}", deleteMovie).Methods("DELETE")
+	r.HandleFunc("/movies/{id}", updateMovie).Methods("PUT")
 
-	// Start the server
 	fmt.Println("Server is running on http://localhost:8080")
-	http.ListenAndServe(":8080", r)
+	log.Fatal(http.ListenAndServe(":8080", r))
 }
